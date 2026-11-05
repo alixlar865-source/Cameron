@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>أثر — ارسم بيديك في الهواء</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0a12;
+    --panel:rgba(21,19,30,.78);
+    --panel-border:rgba(255,255,255,.09);
+    --accent:#ffb454;
+    --text:#f4efe6;
+    --muted:#9a93ab;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:var(--bg);
+    font-family:'IBM Plex Sans Arabic',system-ui,sans-serif;color:var(--text);
+    -webkit-tap-highlight-color:transparent;}
+  video{display:none;}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;}
+
+  .panel{position:fixed;z-index:5;background:var(--panel);backdrop-filter:blur(16px);
+    -webkit-backdrop-filter:blur(16px);border:1px solid var(--panel-border);border-radius:16px;}
+
+  #topbar{top:16px;right:16px;left:16px;display:flex;align-items:center;justify-content:space-between;
+    gap:10px;padding:10px 16px;}
+  #brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15px;}
+  #brand .mark{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent);}
+
+  .btn{border:none;cursor:pointer;padding:10px 20px;border-radius:11px;font-family:inherit;
+    font-weight:700;font-size:13.5px;background:var(--accent);color:#1a1206;
+    transition:transform .15s ease,opacity .15s ease;}
+  .btn:active{transform:scale(.95);}
+  .btn.ghost{background:rgba(255,255,255,.08);color:var(--text);}
+  .btn:disabled{opacity:.45;cursor:default;}
+
+  #hint{bottom:18px;left:50%;transform:translateX(-50%);max-width:min(92vw,560px);
+    text-align:center;font-size:12.5px;line-height:2;color:var(--muted);padding:10px 18px;}
+  #hint b{color:var(--text);font-weight:500;}
+
+  #status{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;gap:16px;
+    align-items:center;justify-content:center;background:var(--bg);text-align:center;padding:28px;}
+  #statusTitle{font-weight:700;font-size:17px;}
+  #statusSub{color:var(--muted);font-size:13px;max-width:280px;line-height:1.9;margin:0;}
+  .ring{width:30px;height:30px;border-radius:50%;border:3px solid rgba(255,255,255,.12);
+    border-top-color:var(--accent);animation:spin 1s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  @media (prefers-reduced-motion: reduce){ .ring{animation-duration:2.5s;} }
+
+  .hidden{display:none !important;}
+</style>
+</head>
+<body>
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="status">
+    <div style="width:14px;height:14px;border-radius:50%;background:var(--accent);box-shadow:0 0 18px var(--accent);"></div>
+    <div id="statusTitle">جاري تحميل نموذج تتبع اليد</div>
+    <div class="ring" id="ring"></div>
+    <p id="statusSub">يحدث هذا مرة واحدة فقط عند فتح الصفحة</p>
+    <button id="camBtn" class="btn hidden">تشغيل الكاميرا والبدء</button>
+  </div>
+
+  <div id="topbar" class="panel hidden">
+    <div id="brand"><span class="mark"></span> أثر</div>
+    <button id="clearBtn" class="btn ghost">مسح اللوحة</button>
+  </div>
+
+  <div id="hint" class="panel hidden">
+    <b>اليد اليمنى</b> ترسم أثناء الحركة &nbsp;·&nbsp; <b>اليد اليسرى</b>: قرّب الإبهام من السبابة لتصغير الشكل وابعدهما لتكبيره
+  </div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const statusTitle = document.getElementById('statusTitle');
+const statusSub = document.getElementById('statusSub');
+const ring = document.getElementById('ring');
+const camBtn = document.getElementById('camBtn');
+const topbar = document.getElementById('topbar');
+const hint = document.getElementById('hint');
+const clearBtn = document.getElementById('clearBtn');
+
+let handLandmarker = null;
+let running = false;
+let lastTimestamp = -1;
+let brushSize = 28, targetBrushSize = 28;
+let hue = 200;
+let shapeCounter = 0;
+
+function paintBackground(){
+  ctx.fillStyle = '#0a0a12';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function resize(){
+  canvas.width = innerWidth;
+  canvas.height = innerHeight;
+  paintBackground();
+}
+window.addEventListener('resize', resize);
+resize();
+
+async function init(){
+  try{
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    try{
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+    }catch(_gpuErr){
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+    }
+    ring.classList.add('hidden');
+    statusTitle.textContent = 'كل شيء جاهز';
+    statusSub.textContent = 'اضغط الزر وامنح إذن الكاميرا عند الطلب';
+    camBtn.classList.remove('hidden');
+  }catch(err){
+    ring.classList.add('hidden');
+    statusTitle.textContent = 'تعذّر تحميل نموذج التتبع';
+    statusSub.textContent = 'تحقق من اتصال الإنترنت ثم أعد تحميل الصفحة';
+    console.error(err);
+  }
+}
+
+async function startCamera(){
+  camBtn.disabled = true;
+  camBtn.textContent = 'جارٍ التشغيل…';
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    statusEl.classList.add('hidden');
+    topbar.classList.remove('hidden');
+    hint.classList.remove('hidden');
+    running = true;
+    requestAnimationFrame(loop);
+  }catch(err){
+    statusEl.classList.remove('hidden');
+    camBtn.disabled = false;
+    camBtn.textContent = 'تشغيل الكاميرا والبدء';
+    statusTitle.textContent = 'تعذّر الوصول إلى الكاميرا';
+    statusSub.textContent = 'فعّل إذن الكاميرا لهذا الموقع من إعدادات المتصفح ثم حاول مجددًا';
+    console.error(err);
+  }
+}
+
+function lerp(a, b, t){ return a + (b - a) * t; }
+function dist(ax, ay, bx, by){ return Math.hypot(ax - bx, ay - by); }
+
+// Mirror horizontally only for on-screen drawing (feels like a mirror);
+// the raw, unmirrored video frame is what gets sent to the model so
+// left/right handedness stays correct.
+function toCanvasXY(point){
+  return { x: (1 - point.x) * canvas.width, y: point.y * canvas.height };
+}
+
+function drawPolygon(sides, r){
+  ctx.beginPath();
+  for(let i = 0; i < sides; i++){
+    const a = i * (Math.PI * 2 / sides) - Math.PI / 2;
+    const px = Math.cos(a) * r, py = Math.sin(a) * r;
+    if(i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawStar(r){
+  const spikes = 5, step = Math.PI / spikes;
+  ctx.beginPath();
+  for(let i = 0; i < spikes * 2; i++){
+    const rad = i % 2 === 0 ? r : r * 0.45;
+    const a = i * step - Math.PI / 2;
+    const px = Math.cos(a) * rad, py = Math.sin(a) * rad;
+    if(i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function stampShape(x, y, size, hueDeg, type){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate((performance.now() / 700) % (Math.PI * 2));
+  const color = `hsl(${hueDeg}, 92%, 62%)`;
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = size * 0.85;
+  ctx.globalAlpha = 0.88;
+
+  switch(type % 5){
+    case 0:
+      ctx.beginPath(); ctx.arc(0, 0, size * 0.5, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 1:
+      ctx.lineWidth = Math.max(3, size * 0.16);
+      ctx.beginPath(); ctx.arc(0, 0, size * 0.42, 0, Math.PI * 2); ctx.stroke();
+      break;
+    case 2:
+      drawStar(size * 0.52);
+      break;
+    case 3:
+      drawPolygon(3, size * 0.55);
+      break;
+    default:
+      drawPolygon(6, size * 0.48);
+  }
+  ctx.restore();
+}
+
+function loop(){
+  if(!running) return;
+  const now = performance.now();
+  if(video.readyState >= 2 && now !== lastTimestamp){
+    lastTimestamp = now;
+    const results = handLandmarker.detectForVideo(video, now);
+    render(results);
+  }
+  requestAnimationFrame(loop);
+}
+
+function render(results){
+  // A soft fade instead of a hard clear leaves a glowing trail behind the moving hand.
+  ctx.fillStyle = 'rgba(10, 10, 18, 0.15)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if(results.landmarks && results.landmarks.length){
+    results.landmarks.forEach((lm, i) => {
+      const handed = results.handednesses[i][0].categoryName; // 'Left' | 'Right'
+      const indexTip = toCanvasXY(lm[8]);
+      const thumbTip = toCanvasXY(lm[4]);
+
+      if(handed === 'Right'){
+        hue = (hue + 1.4) % 360;
+        shapeCounter++;
+        stampShape(indexTip.x, indexTip.y, brushSize, hue, shapeCounter);
+        ctx.save();
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(indexTip.x, indexTip.y, 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      } else {
+        const d = dist(indexTip.x, indexTip.y, thumbTip.x, thumbTip.y);
+        targetBrushSize = Math.max(10, Math.min(150, d * 0.95));
+        const mx = (indexTip.x + thumbTip.x) / 2, my = (indexTip.y + thumbTip.y) / 2;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,.5)';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(mx, my, targetBrushSize * 0.42, 0, Math.PI * 2); ctx.stroke();
+        ctx.restore();
+      }
+    });
+  }
+  brushSize = lerp(brushSize, targetBrushSize, 0.18);
+}
+
+camBtn.addEventListener('click', startCamera);
+clearBtn.addEventListener('click', paintBackground);
+
+init();
+</script>
+</body>
+</html>
